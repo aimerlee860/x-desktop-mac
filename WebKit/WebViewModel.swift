@@ -8,6 +8,7 @@
 import WebKit
 import Combine
 import AppKit
+import Network
 
 /// Handles console.log messages from JavaScript
 class ConsoleLogHandler: NSObject, WKScriptMessageHandler {
@@ -36,6 +37,20 @@ class WebViewModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelega
     @Published private(set) var canGoForward: Bool = false
     @Published private(set) var isAtHome: Bool = true
     @Published private(set) var isLoading: Bool = true
+    @Published private(set) var networkError: (message: String, isRetryable: Bool)?
+
+    // MARK: - Private Properties (Error Recovery)
+
+    private var retryCount: Int = 0
+    private var retryTimer: Timer?
+    private static let maxRetryCount = 3
+    private static let retryDelay: TimeInterval = 2.0
+
+    // MARK: - Private Properties (Network Monitoring)
+
+    private let pathMonitor = NWPathMonitor()
+    private let monitorQueue = DispatchQueue(label: "com.x-desktop.network-monitor")
+    private var lastPathInterfaces: Set<String> = []
 
     // MARK: - Private Properties
 
@@ -64,6 +79,7 @@ class WebViewModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelega
         setupObservers()
         setupMemoryPressureHandling()
         setupBackgroundHandling()
+        setupNetworkMonitor()
         loadHome()
     }
 
@@ -92,7 +108,21 @@ class WebViewModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelega
     }
 
     func reload() {
+        retryCount = 0
+        retryTimer?.invalidate()
+        retryTimer = nil
+        networkError = nil
         wkWebView.reload()
+    }
+
+    func retryAfterError() {
+        retryCount = 0
+        retryTimer?.invalidate()
+        retryTimer = nil
+        networkError = nil
+        clearWebsiteData {
+            self.wkWebView.reload()
+        }
     }
 
     // MARK: - WKNavigationDelegate
@@ -116,11 +146,58 @@ class WebViewModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelega
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        print("[WebView] Nav failed: \(error.localizedDescription)")
+        handleNavigationError(error)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        print("[WebView] Provisional nav failed: \(error.localizedDescription)")
+        handleNavigationError(error)
+    }
+
+    private func handleNavigationError(_ error: Error) {
+        let nsError = error as NSError
+        guard nsError.domain == NSURLErrorDomain, nsError.code != NSURLErrorCancelled else { return }
+
+        let isRetryable: Bool = [
+            NSURLErrorTimedOut,
+            NSURLErrorCannotConnectToHost,
+            NSURLErrorNetworkConnectionLost,
+            NSURLErrorNotConnectedToInternet,
+            NSURLErrorDNSLookupFailed,
+            NSURLErrorCannotFindHost,
+            NSURLErrorResourceUnavailable,
+        ].contains(nsError.code)
+
+        let message: String
+        switch nsError.code {
+        case NSURLErrorTimedOut:
+            message = "连接超时，请检查网络"
+        case NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost:
+            message = "网络连接已断开"
+        case NSURLErrorDNSLookupFailed, NSURLErrorCannotFindHost:
+            message = "DNS 解析失败，请检查网络或 VPN 设置"
+        case NSURLErrorCannotConnectToHost:
+            message = "无法连接到服务器"
+        default:
+            message = "网络错误：\(error.localizedDescription)"
+        }
+
+        if isRetryable && retryCount < Self.maxRetryCount {
+            retryCount += 1
+            retryTimer?.invalidate()
+            retryTimer = Timer.scheduledTimer(withTimeInterval: Self.retryDelay, repeats: false) { [weak self] _ in
+                guard let self = self else { return }
+                self.clearWebsiteData {
+                    self.wkWebView.reload()
+                }
+            }
+        } else {
+            networkError = (message: message, isRetryable: isRetryable)
+        }
+    }
+
+    private func clearWebsiteData(completion: @escaping () -> Void) {
+        let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+        WKWebsiteDataStore.default().removeData(ofTypes: dataTypes, modifiedSince: Date().addingTimeInterval(-300), completionHandler: completion)
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
@@ -357,7 +434,12 @@ class WebViewModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelega
         }
 
         loadingObserver = wkWebView.observe(\.isLoading, options: [.new, .initial]) { [weak self] webView, _ in
-            self?.isLoading = webView.isLoading
+            guard let self = self else { return }
+            self.isLoading = webView.isLoading
+            if !webView.isLoading && self.networkError != nil {
+                self.networkError = nil
+                self.retryCount = 0
+            }
         }
 
         urlObserver = wkWebView.observe(\.url, options: .new) { [weak self] webView, _ in
@@ -389,11 +471,59 @@ class WebViewModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelega
         }
     }
 
+    // MARK: - Network Monitoring
+
+    private func setupNetworkMonitor() {
+        let initialPath = pathMonitor.currentPath
+        lastPathInterfaces = currentInterfaces(from: initialPath)
+
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self, !self.isCleanedUp else { return }
+
+            let newInterfaces = self.currentInterfaces(from: path)
+            let routeChanged = newInterfaces != self.lastPathInterfaces
+            let becameReachable = path.status == .satisfied
+
+            self.lastPathInterfaces = newInterfaces
+
+            if routeChanged && becameReachable {
+                DispatchQueue.main.async {
+                    self.handleNetworkPathChange()
+                }
+            }
+        }
+        pathMonitor.start(queue: monitorQueue)
+    }
+
+    private func currentInterfaces(from path: NWPath) -> Set<String> {
+        var interfaces: Set<String> = []
+        if path.usesInterfaceType(.wifi) { interfaces.insert("wifi") }
+        if path.usesInterfaceType(.wiredEthernet) { interfaces.insert("ethernet") }
+        if path.usesInterfaceType(.cellular) { interfaces.insert("cellular") }
+        if path.usesInterfaceType(.other) { interfaces.insert("other") }
+        if path.usesInterfaceType(.loopback) { interfaces.insert("loopback") }
+        return interfaces
+    }
+
+    private func handleNetworkPathChange() {
+        guard !wkWebView.isLoading else { return }
+        retryCount = 0
+        networkError = nil
+        clearWebsiteData { [weak self] in
+            self?.wkWebView.reload()
+        }
+    }
+
     // MARK: - Cleanup
 
     func cleanup() {
         guard !isCleanedUp else { return }
         isCleanedUp = true
+
+        retryTimer?.invalidate()
+        retryTimer = nil
+
+        pathMonitor.cancel()
 
         // 1. 停止摄像头和麦克风捕获（立即释放硬件设备）
         if #available(macOS 12.0, *) {
